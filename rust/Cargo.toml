@@ -1,0 +1,19 @@
+[package]
+name = "dist-mdns"
+version = "0.1.0"
+edition = "2021"
+description = "Distributed mDNS (Scalable DNS-SD) client implementing RFC 6762, 6763, 8375, 8490, 8764, 8765, 8766, and 2136"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hmac = "0.12"
+rand = "0.8"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-native-certs = "0.8"
+sha2 = "0.10"
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+
+[dev-dependencies]
+rcgen = "0.13"
