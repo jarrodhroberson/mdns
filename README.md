@@ -72,9 +72,11 @@ cargo run --bin dmdns -- resolve "My Service._http._tcp.local."
 # Register a service locally (.local.) or via DNS Update
 cargo run --bin dmdns -- register "Test Service" _http._tcp local. 8080 --host myhost.local. --ip 192.168.1.10
 
-# Discover all services on local. and dump them (format: json [default] or text)
+# Discover all services on local. and dump them (format: json [default] or text or yaml)
 cargo run --bin dmdns -- dump
+cargo run --bin dmdns -- dump --format json
 cargo run --bin dmdns -- dump --format text
+cargo run --bin dmdns -- dump --format yaml
 ```
 
 ---
