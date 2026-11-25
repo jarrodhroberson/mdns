@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 enum DumpFormat {
     Json,
     Text,
+    Yaml,
 }
 
 #[derive(Parser)]
@@ -272,6 +273,7 @@ async fn dump_local_services(
     Ok(match format {
         DumpFormat::Json => format_dump_json("local.", &dumped_services),
         DumpFormat::Text => format_dump_text("local.", &dumped_services),
+        DumpFormat::Yaml => format_dump_yaml("local.", &dumped_services),
     })
 }
 
@@ -388,9 +390,131 @@ fn format_dump_text(domain: &str, services: &[DumpedServiceType]) -> String {
     out.trim_end().to_string()
 }
 
+/// Quote a string as a YAML flow scalar, using double-quote style only when
+/// the value contains characters that require escaping (control chars, `"`, `\`).
+/// Plain (unquoted) style is used when the value is safe — this keeps the
+/// output readable. Values that could be misread as YAML types (true, false,
+/// null, numbers) are always quoted.
+fn yaml_scalar(s: &str) -> String {
+    // Values that must be quoted to avoid YAML type confusion.
+    let needs_quoting = matches!(
+        s.to_ascii_lowercase().as_str(),
+        "true" | "false" | "null" | "yes" | "no" | "on" | "off" | "~"
+    ) || s.is_empty()
+        || s.starts_with(|c: char| c == '-' || c == '&' || c == '*' || c == '!' || c == '|'
+            || c == '>' || c == '\'' || c == '"' || c == '%' || c == '@' || c == '`'
+            || c == '{' || c == '}' || c == '[' || c == ']' || c == '#' || c == ':')
+        || s.contains(|c: char| c == ':' || c == '#' || c.is_ascii_control());
+
+    // Check if any character requires double-quote escaping.
+    let has_special = s.chars().any(|c| matches!(c, '"' | '\\') || (c as u32) < 0x20);
+
+    if !needs_quoting && !has_special {
+        return s.to_string(); // safe plain scalar
+    }
+
+    // Double-quoted scalar with minimal escaping.
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\x{:02X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn format_dump_yaml(domain: &str, services: &[DumpedServiceType]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "domain: {}", yaml_scalar(domain));
+    out.push_str("services:");
+    if services.is_empty() {
+        out.push_str(" []\n");
+        return out;
+    }
+    out.push('\n');
+    for svc in services {
+        let _ = writeln!(out, "  - service_type: {}", yaml_scalar(&svc.service_type));
+        out.push_str("    instances:");
+        if svc.instances.is_empty() {
+            out.push_str(" []\n");
+            continue;
+        }
+        out.push('\n');
+        for inst in &svc.instances {
+            let _ = writeln!(out, "      - instance: {}", yaml_scalar(&inst.instance));
+            match &inst.target {
+                Some(t) => {
+                    let _ = writeln!(out, "        target: {}", yaml_scalar(t));
+                }
+                None => out.push_str("        target: null\n"),
+            }
+            match inst.port {
+                Some(p) => {
+                    let _ = writeln!(out, "        port: {p}");
+                }
+                None => out.push_str("        port: null\n"),
+            }
+            out.push_str("        txt:\n");
+            if inst.txt.is_empty() {
+                // Replace the "txt:\n" we just appended with "txt: []\n".
+                let len = out.len();
+                out.truncate(len - "        txt:\n".len());
+                out.push_str("        txt: []\n");
+            } else {
+                for t in &inst.txt {
+                    let _ = writeln!(out, "          - {}", yaml_scalar(t));
+                }
+            }
+            out.push_str("        addresses:\n");
+            if inst.addresses.is_empty() {
+                let len = out.len();
+                out.truncate(len - "        addresses:\n".len());
+                out.push_str("        addresses: []\n");
+            } else {
+                for addr in &inst.addresses {
+                    let _ = writeln!(out, "          - {}", yaml_scalar(&addr.to_string()));
+                }
+            }
+            match &inst.error {
+                Some(e) => {
+                    let _ = writeln!(out, "        error: {}", yaml_scalar(e));
+                }
+                None => out.push_str("        error: null\n"),
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_services() -> Vec<DumpedServiceType> {
+        vec![DumpedServiceType {
+            service_type: "_http._tcp.local.".to_string(),
+            instances: vec![DumpedInstance {
+                instance: "Web\\ \"1\"._http._tcp.local.".to_string(),
+                target: Some("host.local.".to_string()),
+                port: Some(8080),
+                txt: vec!["path=/".to_string()],
+                addresses: vec!["192.0.2.10".parse().unwrap()],
+                error: None,
+            }],
+        }]
+    }
+
+    // --- CLI parsing ---
 
     #[test]
     fn cli_dump_defaults_to_json() {
@@ -402,52 +526,132 @@ mod tests {
     }
 
     #[test]
-    fn cli_dump_accepts_json_and_text() {
-        let cli_json = Cli::try_parse_from(["dmdns", "dump", "--format", "json"]).unwrap();
-        assert!(matches!(
-            cli_json.cmd,
-            Command::Dump {
-                format: DumpFormat::Json
-            }
-        ));
-
-        let cli_text = Cli::try_parse_from(["dmdns", "dump", "--format", "text"]).unwrap();
-        assert!(matches!(
-            cli_text.cmd,
-            Command::Dump {
-                format: DumpFormat::Text
-            }
-        ));
-
+    fn cli_dump_accepts_all_formats() {
+        for (arg, expected) in [
+            ("json", DumpFormat::Json),
+            ("text", DumpFormat::Text),
+            ("yaml", DumpFormat::Yaml),
+        ] {
+            let cli = Cli::try_parse_from(["dmdns", "dump", "--format", arg])
+                .unwrap_or_else(|e| panic!("parse failed for {arg}: {e}"));
+            assert!(
+                matches!(cli.cmd, Command::Dump { format } if format == expected),
+                "wrong variant for {arg}"
+            );
+        }
         assert!(Cli::try_parse_from(["dmdns", "dump", "--format", "xml"]).is_err());
     }
 
-    #[test]
-    fn format_dump_outputs_expected_json_and_text() {
-        let services = vec![DumpedServiceType {
-            service_type: "_http._tcp.local.".to_string(),
-            instances: vec![DumpedInstance {
-                instance: "Web\\ \"1\"._http._tcp.local.".to_string(),
-                target: Some("host.local.".to_string()),
-                port: Some(8080),
-                txt: vec!["path=/".to_string()],
-                addresses: vec!["192.0.2.10".parse().unwrap()],
-                error: None,
-            }],
-        }];
+    // --- JSON format ---
 
+    #[test]
+    fn format_dump_json_expected_output() {
+        let services = sample_services();
         let json = format_dump_json("local.", &services);
+
         assert!(json.contains("\"domain\": \"local.\""));
         assert!(json.contains("\"service_type\": \"_http._tcp.local.\""));
+        // instance name has backslash and quote, both must be escaped in JSON
         assert!(json.contains("\"instance\": \"Web\\\\ \\\"1\\\"._http._tcp.local.\""));
         assert!(json.contains("\"port\": 8080"));
         assert!(json.contains("\"addresses\": [\"192.0.2.10\"]"));
+        assert!(json.contains("\"txt\": [\"path=/\"]"));
+        assert!(json.contains("\"error\": null"));
+    }
 
+    #[test]
+    fn format_dump_json_empty() {
+        let json = format_dump_json("local.", &[]);
+        assert!(json.contains("\"services\": []"));
+        assert!(json.contains("\"domain\": \"local.\""));
+    }
+
+    // --- Text format ---
+
+    #[test]
+    fn format_dump_text_expected_output() {
+        let services = sample_services();
         let text = format_dump_text("local.", &services);
+
         assert!(text.contains("Domain: local."));
         assert!(text.contains("Service Type: _http._tcp.local."));
         assert!(text.contains("Target: host.local.:8080"));
         assert!(text.contains("Addresses: 192.0.2.10"));
         assert!(text.contains("TXT: path=/"));
+    }
+
+    #[test]
+    fn format_dump_text_empty() {
+        let text = format_dump_text("local.", &[]);
+        assert!(text.contains("No services discovered."));
+    }
+
+    // --- YAML format ---
+
+    #[test]
+    fn format_dump_yaml_expected_output() {
+        let services = sample_services();
+        let yaml = format_dump_yaml("local.", &services);
+
+        assert!(yaml.starts_with("domain: local.\n"), "missing domain line:\n{yaml}");
+        assert!(yaml.contains("service_type: _http._tcp.local."), "missing service_type:\n{yaml}");
+        // instance name contains backslash and double-quote — must be double-quoted
+        assert!(
+            yaml.contains("instance: \"Web\\\\ \\\"1\\\"._http._tcp.local.\""),
+            "missing or mis-escaped instance:\n{yaml}"
+        );
+        assert!(yaml.contains("target: host.local."), "missing target:\n{yaml}");
+        assert!(yaml.contains("port: 8080"), "missing port:\n{yaml}");
+        assert!(yaml.contains("- path=/"), "missing txt entry:\n{yaml}");
+        assert!(yaml.contains("- 192.0.2.10"), "missing address:\n{yaml}");
+        assert!(yaml.contains("error: null"), "missing null error:\n{yaml}");
+    }
+
+    #[test]
+    fn format_dump_yaml_empty() {
+        let yaml = format_dump_yaml("local.", &[]);
+        assert!(yaml.contains("services: []"), "empty services not []:\n{yaml}");
+    }
+
+    #[test]
+    fn format_dump_yaml_null_fields() {
+        let services = vec![DumpedServiceType {
+            service_type: "_ssh._tcp.local.".to_string(),
+            instances: vec![DumpedInstance {
+                instance: "My SSH._ssh._tcp.local.".to_string(),
+                target: None,
+                port: None,
+                txt: vec![],
+                addresses: vec![],
+                error: Some("no SRV record found".to_string()),
+            }],
+        }];
+        let yaml = format_dump_yaml("local.", &services);
+        assert!(yaml.contains("target: null"), "expected null target:\n{yaml}");
+        assert!(yaml.contains("port: null"), "expected null port:\n{yaml}");
+        assert!(yaml.contains("txt: []"), "expected empty txt list:\n{yaml}");
+        assert!(yaml.contains("addresses: []"), "expected empty addresses list:\n{yaml}");
+        assert!(yaml.contains("error: no SRV record found"), "expected error string:\n{yaml}");
+    }
+
+    #[test]
+    fn yaml_scalar_quoting_rules() {
+        // Safe plain scalars — no quotes needed.
+        assert_eq!(yaml_scalar("host.local."), "host.local.");
+        assert_eq!(yaml_scalar("192.0.2.10"), "192.0.2.10");
+        assert_eq!(yaml_scalar("path=/index.html"), "path=/index.html");
+
+        // Reserved words must be quoted.
+        assert_eq!(yaml_scalar("true"), "\"true\"");
+        assert_eq!(yaml_scalar("null"), "\"null\"");
+        assert_eq!(yaml_scalar(""), "\"\"");
+
+        // Leading special chars must be quoted.
+        assert_eq!(yaml_scalar("#comment"), "\"#comment\"");
+        assert_eq!(yaml_scalar(":value"), "\":value\"");
+
+        // Backslash and double-quote inside a double-quoted scalar.
+        assert_eq!(yaml_scalar("a\\b"), "\"a\\\\b\"");
+        assert_eq!(yaml_scalar("say \"hi\""), "\"say \\\"hi\\\"\"");
     }
 }
