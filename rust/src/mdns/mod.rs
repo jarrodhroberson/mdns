@@ -110,8 +110,47 @@ impl MdnsEngine {
         if published.is_empty() {
             return;
         }
+
+        // The meta-query name used by DNS-SD service enumeration (RFC 6763 §9).
+        let meta_qname = DnsName::from_str_dotted("_services._dns-sd._udp.local.").unwrap();
+
         let mut answers = Vec::new();
         for q in &query.questions {
+            // RFC 6763 §9: answer _services._dns-sd._udp.local. PTR queries by
+            // synthesising one PTR record per registered service type.
+            if (q.qtype == RrType::PTR || q.qtype == RrType::ANY) && q.qname == meta_qname {
+                for svc in published.values() {
+                    // Find the PTR record(s) for this service to extract the
+                    // service type name (the PTR owner name, e.g. _http._tcp.local.).
+                    for rr in &svc.records {
+                        if rr.rtype == RrType::PTR {
+                            // Build a synthesised enumeration PTR:
+                            //   _services._dns-sd._udp.local. PTR _http._tcp.local.
+                            let service_type_name = rr.name.clone();
+                            let synth = DnsRecord {
+                                name: meta_qname.clone(),
+                                rtype: RrType::PTR,
+                                rclass: RrClass::IN,
+                                ttl: rr.ttl,
+                                rdata: RData::PTR(service_type_name),
+                            };
+                            // Known-Answer suppression.
+                            let suppressed = query.answers.iter().any(|ka| {
+                                ka.name == synth.name
+                                    && ka.rtype == synth.rtype
+                                    && ka.rdata == synth.rdata
+                                    && ka.ttl >= synth.ttl / 2
+                            });
+                            if !suppressed && !answers.iter().any(|a: &DnsRecord| a.rdata == synth.rdata) {
+                                answers.push(synth);
+                            }
+                            break; // only one PTR per service
+                        }
+                    }
+                }
+                continue;
+            }
+
             for svc in published.values() {
                 for rr in &svc.records {
                     if rr.name == q.qname
@@ -385,6 +424,8 @@ fn bind_mdns_v4() -> io::Result<UdpSocket> {
     sock.bind(&SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())?;
     sock.join_multicast_v4(&MDNS_V4_ADDR, &Ipv4Addr::UNSPECIFIED)?;
     sock.set_multicast_ttl_v4(255)?;
+    // Enable loopback so processes on the same host see each other's mDNS traffic.
+    sock.set_multicast_loop_v4(true)?;
     UdpSocket::from_std(sock.into())
 }
 
@@ -398,5 +439,7 @@ fn bind_mdns_v6() -> io::Result<UdpSocket> {
     sock.bind(&SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0)).into())?;
     sock.join_multicast_v6(&MDNS_V6_ADDR, 0)?;
     sock.set_multicast_hops_v6(255)?;
+    // Enable loopback so processes on the same host see each other's mDNS traffic.
+    sock.set_multicast_loop_v6(true)?;
     UdpSocket::from_std(sock.into())
 }

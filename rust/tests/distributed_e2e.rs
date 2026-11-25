@@ -13,6 +13,99 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
+
+// ---------------------------------------------------------------------------
+// Integration test: register an HTTP service, then dump and verify it appears.
+// ---------------------------------------------------------------------------
+//
+// This test spawns two separate dmdns processes:
+//   1. `dmdns register` – registers "Test HTTP Server._http._tcp.local." and
+//      keeps it alive via mDNS for the duration of the test.
+//   2. `dmdns dump`     – discovers all services on local. and prints them.
+//
+// Because both processes share the same host multicast interface the
+// registered service announcements are visible to the dump process via
+// IP_MULTICAST_LOOP (confirmed enabled on this machine).
+//
+// The test asserts that:
+//   - The dump output contains the service type "_http._tcp.local."
+//   - The dump output contains the instance name we registered.
+// ---------------------------------------------------------------------------
+
+/// Build the dmdns binary (once) and return its path.
+fn dmdns_bin() -> std::path::PathBuf {
+    // `cargo test` already built the test harness; build the bin too.
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--bin", "dmdns"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("failed to run cargo build");
+    assert!(status.success(), "cargo build --bin dmdns failed");
+
+    // Cargo puts the binary next to the test executable.
+    let mut bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    bin.push("target/debug/dmdns");
+    bin
+}
+
+#[test]
+fn dump_discovers_registered_http_service() {
+    let bin = dmdns_bin();
+
+    // ---- 1. Start the registrar process ----
+    // "Test HTTP Server" on _http._tcp.local., port 8080, host testhost.local.
+    let mut registrar = std::process::Command::new(&bin)
+        .args([
+            "register",
+            "Test HTTP Server",
+            "_http._tcp",
+            "local.",
+            "8080",
+            "--host",
+            "testhost.local.",
+            "--ip",
+            "192.0.2.1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn dmdns register");
+
+    // Give the registrar enough time to complete 3 probes (3×250 ms) plus two
+    // announce packets and their inter-packet gap (~2 s total is generous).
+    std::thread::sleep(Duration::from_secs(2));
+
+    // ---- 2. Run dump and capture its output ----
+    // dump sends the meta-query twice (1 s apart) then waits 2 s = ~4 s total.
+    // Allow up to 15 s for the whole command.
+    let dump_output = std::process::Command::new(&bin)
+        .args(["dump", "--format", "text"])
+        .output()
+        .expect("failed to spawn dmdns dump");
+
+    // ---- 3. Kill the registrar ----
+    let _ = registrar.kill();
+    let _ = registrar.wait();
+
+    // ---- 4. Assert ----
+    let stdout = String::from_utf8_lossy(&dump_output.stdout);
+    let stderr = String::from_utf8_lossy(&dump_output.stderr);
+
+    assert!(
+        dump_output.status.success(),
+        "dmdns dump exited with error.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    assert!(
+        stdout.contains("_http._tcp.local."),
+        "dump output did not contain the service type '_http._tcp.local.'.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    assert!(
+        stdout.contains("Test HTTP Server"),
+        "dump output did not contain the instance name 'Test HTTP Server'.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 
